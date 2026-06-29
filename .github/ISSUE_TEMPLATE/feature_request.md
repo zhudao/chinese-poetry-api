@@ -1,20 +1,20 @@
 ---
-name: Feature request
-about: Suggest an idea for this project
-title: ''
-labels: ''
+name: 功能建议
+about: 为项目提出新功能或改进建议
+title: '[Feature] '
+labels: 'enhancement'
 assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+**背景与动机**
+请描述你希望解决的问题或使用场景。例如：我在使用 API 时，希望能够……
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+**期望的功能**
+清晰描述你希望新增或改进的功能。
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+**参考方案**
+如果有类似的实现（其他 API、开源项目等），可以附上链接或描述。
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+**附加信息**
+其他你认为有参考价值的内容，例如数据样例、接口设计草稿等。

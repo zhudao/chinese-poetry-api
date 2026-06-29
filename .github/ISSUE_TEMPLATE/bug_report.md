@@ -1,38 +1,39 @@
 ---
-name: Bug report
-about: Create a report to help us improve
-title: ''
-labels: ''
+name: 问题反馈
+about: 报告一个 Bug，帮助我们改进
+title: '[Bug] '
+labels: 'bug'
 assignees: ''
 
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**问题描述**
+请简洁清晰地描述遇到的问题。
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+**复现步骤**
+请提供可以稳定复现问题的步骤：
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+- 接口地址（REST / GraphQL）：
+- 请求方法及参数：
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+```
+# 示例
+GET /v1/poems?dynasty=唐&page=1
+```
 
-**Desktop (please complete the following information):**
- - OS: [e.g. iOS]
- - Browser [e.g. chrome, safari]
- - Version [e.g. 22]
+- 实际返回结果：
 
-**Smartphone (please complete the following information):**
- - Device: [e.g. iPhone6]
- - OS: [e.g. iOS8.1]
- - Browser [e.g. stock browser, safari]
- - Version [e.g. 22]
+```json
 
-**Additional context**
-Add any other context about the problem here.
+```
+
+**预期行为**
+描述你期望得到的结果。
+
+**环境信息**
+ - 部署方式：[ ] Docker  [ ] 源码编译  [ ] 在线版 (poetry.palemoky.com)
+ - 版本号（`docker inspect` 或 `git log` 查看）：
+ - 操作系统：
+
+**附加信息**
+如有错误日志、截图或其他相关信息，请附在此处。
