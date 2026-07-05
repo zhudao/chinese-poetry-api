@@ -58,7 +58,7 @@ git clone --recurse-submodules --depth=1 https://github.com/palemoky/chinese-poe
 如果已经克隆了仓库，可以单独更新 submodules：
 
 ```bash
-git submodule update --init
+git submodule update --init --depth 1
 ```
 
 ## API 使用
@@ -90,6 +90,7 @@ curl "http://localhost:1279/api/v1/poems/random"
 # 随机诗词（带过滤）
 curl "http://localhost:1279/api/v1/poems/random?author=李白"
 curl "http://localhost:1279/api/v1/poems/random?type=五言绝句"
+curl "http://localhost:1279/api/v1/poems/random?char=春" # 飞花令等单字场景
 curl "http://localhost:1279/api/v1/poems/random?author=李白&type=五言绝句"
 curl "http://localhost:1279/api/v1/poems/random?author=李白&type=五言绝句&dynasty=唐"
 curl "http://localhost:1279/api/v1/poems/random?author=李白&dynasty=唐&type=五言绝句&type=七言绝句&type=五言律诗"

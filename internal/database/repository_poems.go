@@ -245,6 +245,50 @@ func (r *Repository) GetRandomPoem(dynastyID, authorID *int64, typeIDs []int64) 
 	return r.GetPoemByID(strconv.FormatInt(poem.ID, 10))
 }
 
+// GetRandomPoemByChar returns a random poem whose content contains the given
+// character (for 飞花令-style games). Unlike GetRandomPoem, this is intentionally
+// not combinable with author/type/dynasty filters: the FTS join it uses to locate
+// candidates and the id/dynasty/author/type filters used elsewhere are separate
+// query shapes, and mixing them would make the "no filters other than char" API
+// contract (enforced by the handler) easy to silently violate.
+// Uses COUNT + random OFFSET for uniform distribution across matching poems.
+func (r *Repository) GetRandomPoemByChar(char string) (*Poem, error) {
+	poemTable := r.poemsTable()
+	ftsTable := r.poemsFtsTable()
+	pattern := "%" + char + "%"
+
+	matches := func(q *gorm.DB) *gorm.DB {
+		return q.Joins("JOIN "+ftsTable+" ON "+ftsTable+".rowid = "+poemTable+".id").
+			Where(ftsTable+".content_text LIKE ?", pattern)
+	}
+
+	// Count matching poems
+	var count int64
+	if err := matches(r.db.Table(poemTable)).Count(&count).Error; err != nil || count == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	// Generate a random offset in [0, count)
+	randomBig, err := rand.Int(rand.Reader, big.NewInt(count))
+	if err != nil {
+		return nil, err
+	}
+	offset := int(randomBig.Int64())
+
+	// Fetch the poem at the random offset
+	var poem Poem
+	err = matches(r.db.Table(poemTable)).
+		Select(poemTable + ".*").
+		Order(poemTable + ".id ASC").
+		Offset(offset).Limit(1).First(&poem).Error
+	if err != nil {
+		return nil, err
+	}
+
+	// Load the full poem by ID with all relations
+	return r.GetPoemByID(strconv.FormatInt(poem.ID, 10))
+}
+
 // ListAuthorPoems returns a paginated list of poems by a specific author
 func (r *Repository) ListAuthorPoems(authorID int64, limit, offset int) ([]Poem, int, error) {
 	var totalCount int64
@@ -267,7 +311,11 @@ func (r *Repository) ListAuthorPoems(authorID int64, limit, offset int) ([]Poem,
 	return poems, int(totalCount), nil
 }
 
-// SearchPoems searches for poems with full-text search support
+// SearchPoems searches for poems using the FTS5 trigram index built over title
+// and content (see migrateFtsForLang). The trigram tokenizer lets LIKE '%...%'
+// queries run against the FTS index instead of scanning the poems table, while
+// keeping the same substring-match semantics (including single/double-character
+// CJK queries, which classic FTS5 MATCH can't handle).
 // searchType can be: "all", "title", "content", "author"
 func (r *Repository) SearchPoems(query string, searchType string, page, pageSize int) ([]Poem, int64, error) {
 	if page < 1 {
@@ -281,16 +329,24 @@ func (r *Repository) SearchPoems(query string, searchType string, page, pageSize
 	pattern := "%" + query + "%"
 	poemTable := r.poemsTable()
 	authorTable := r.authorsTable()
+	ftsTable := r.poemsFtsTable()
+	ftsJoin := "JOIN " + ftsTable + " ON " + ftsTable + ".rowid = " + poemTable + ".id"
 
 	var poems []Poem
 	var total int64
 
 	switch searchType {
 	case "title":
-		// Search in title only
-		r.db.Table(poemTable).Where("title LIKE ?", pattern).Count(&total)
+		// Search in title only, via the FTS trigram index
+		r.db.Table(poemTable).
+			Joins(ftsJoin).
+			Where(ftsTable+".title LIKE ?", pattern).
+			Count(&total)
 		err := r.db.Table(poemTable).
-			Where("title LIKE ?", pattern).
+			Select(poemTable+".*").
+			Joins(ftsJoin).
+			Where(ftsTable+".title LIKE ?", pattern).
+			Order(poemTable + ".id").
 			Limit(pageSize).Offset(offset).
 			Find(&poems).Error
 		if err != nil {
@@ -298,10 +354,16 @@ func (r *Repository) SearchPoems(query string, searchType string, page, pageSize
 		}
 
 	case "content":
-		// Search in content only
-		r.db.Table(poemTable).Where("content LIKE ?", pattern).Count(&total)
+		// Search in content only, via the FTS trigram index
+		r.db.Table(poemTable).
+			Joins(ftsJoin).
+			Where(ftsTable+".content_text LIKE ?", pattern).
+			Count(&total)
 		err := r.db.Table(poemTable).
-			Where("content LIKE ?", pattern).
+			Select(poemTable+".*").
+			Joins(ftsJoin).
+			Where(ftsTable+".content_text LIKE ?", pattern).
+			Order(poemTable + ".id").
 			Limit(pageSize).Offset(offset).
 			Find(&poems).Error
 		if err != nil {
@@ -309,14 +371,16 @@ func (r *Repository) SearchPoems(query string, searchType string, page, pageSize
 		}
 
 	case "author":
-		// Search in author name
+		// Search in author name (small table, plain LIKE is fast enough)
 		r.db.Table(poemTable).
 			Joins("JOIN "+authorTable+" ON "+poemTable+".author_id = "+authorTable+".id").
 			Where(authorTable+".name LIKE ?", pattern).
 			Count(&total)
 		err := r.db.Table(poemTable).
+			Select(poemTable+".*").
 			Joins("JOIN "+authorTable+" ON "+poemTable+".author_id = "+authorTable+".id").
 			Where(authorTable+".name LIKE ?", pattern).
+			Order(poemTable + ".id").
 			Limit(pageSize).Offset(offset).
 			Find(&poems).Error
 		if err != nil {
@@ -324,16 +388,20 @@ func (r *Repository) SearchPoems(query string, searchType string, page, pageSize
 		}
 
 	default: // "all"
-		// Search in title, content, and author name
+		// Search in title, content (via FTS) and author name
 		r.db.Table(poemTable).
+			Joins(ftsJoin).
 			Joins("LEFT JOIN "+authorTable+" ON "+poemTable+".author_id = "+authorTable+".id").
-			Where(poemTable+".title LIKE ? OR "+poemTable+".content LIKE ? OR "+authorTable+".name LIKE ?",
+			Where(ftsTable+".title LIKE ? OR "+ftsTable+".content_text LIKE ? OR "+authorTable+".name LIKE ?",
 				pattern, pattern, pattern).
 			Count(&total)
 		err := r.db.Table(poemTable).
+			Select(poemTable+".*").
+			Joins(ftsJoin).
 			Joins("LEFT JOIN "+authorTable+" ON "+poemTable+".author_id = "+authorTable+".id").
-			Where(poemTable+".title LIKE ? OR "+poemTable+".content LIKE ? OR "+authorTable+".name LIKE ?",
+			Where(ftsTable+".title LIKE ? OR "+ftsTable+".content_text LIKE ? OR "+authorTable+".name LIKE ?",
 				pattern, pattern, pattern).
+			Order(poemTable + ".id").
 			Limit(pageSize).Offset(offset).
 			Find(&poems).Error
 		if err != nil {

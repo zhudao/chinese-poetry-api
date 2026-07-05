@@ -3,6 +3,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -76,13 +77,44 @@ func (h *PoemHandler) SearchPoems(c *gin.Context) {
 	c.JSON(http.StatusOK, NewPaginationResponse(data, pagination, total))
 }
 
+// filterQueryKeys lists every RandomPoem filter param other than char/lang.
+// Used to reject char being combined with them (see RandomPoem doc comment).
+var filterQueryKeys = []string{"author_id", "author", "type_id", "type", "dynasty_id", "dynasty"}
+
 // RandomPoem returns a random poem with optional filters
 // Supports ?lang=zh-Hans (default) or ?lang=zh-Hant
 // Supports filters: ?author=李白&type=五言绝句&type=七言绝句&dynasty=唐
 // Or by ID: ?author_id=123&type_id=456&type_id=789&dynasty_id=789
+//
+// Supports 飞花令-style single-character search: ?char=春
+// char is only combinable with lang - not with author/type/dynasty filters,
+// since it selects poems via the FTS content index rather than the id-based
+// filters used elsewhere in this handler.
 func (h *PoemHandler) RandomPoem(c *gin.Context) {
 	lang := parseLang(c)
 	repo := h.repo.WithLang(lang)
+
+	if char := c.Query("char"); char != "" {
+		for _, key := range filterQueryKeys {
+			if c.Query(key) != "" {
+				respondError(c, http.StatusBadRequest, "char cannot be combined with author/type/dynasty filters")
+				return
+			}
+		}
+		if utf8.RuneCountInString(char) != 1 {
+			respondError(c, http.StatusBadRequest, "char must be a single character")
+			return
+		}
+
+		poem, err := repo.GetRandomPoemByChar(char)
+		if err != nil {
+			respondError(c, http.StatusNotFound, "no poems found containing the given character")
+			return
+		}
+
+		c.JSON(http.StatusOK, formatPoem(poem))
+		return
+	}
 
 	// Parse filter parameters
 	var authorID, dynastyID *int64
