@@ -10,9 +10,11 @@ func (r *Repository) GetAuthorsWithStats(limit, offset int) ([]AuthorWithStats, 
 
 	var authors []AuthorWithStats
 
-	// Use subquery for better performance on large datasets
+	// Pre-aggregate poem counts by author_id, then join authors for pagination.
 	err := r.db.Table(authorTable).
-		Select(authorTable + ".*, (SELECT COUNT(*) FROM " + poemTable + " WHERE " + poemTable + ".author_id = " + authorTable + ".id) as poem_count").
+		Select(authorTable + ".*, COUNT(" + poemTable + ".id) AS poem_count").
+		Joins("LEFT JOIN " + poemTable + " ON " + authorTable + ".id = " + poemTable + ".author_id").
+		Group(authorTable + ".id").
 		Order("poem_count DESC").
 		Limit(limit).
 		Offset(offset).
