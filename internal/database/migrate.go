@@ -2,6 +2,7 @@ package database
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -20,26 +21,91 @@ type DB struct {
 	// 是因为 Repository.WithLang 每次都会返回一个新实例（每个请求至少一次），
 	// 挂在 Repository 上的缓存永远不会被命中。
 	counts countCache
+
+	// idLists 缓存短查询经倒排索引求出的完整命中列表，理由同上。
+	idLists idListCache
 }
 
-// Open 打开 SQLite 数据库连接。
+// Open 以读写方式打开 SQLite 数据库连接，供数据导入使用。
 // maxOpenConns：最大连接数，传 0 则取保守默认值 1。
 // maxIdleConns：最大空闲连接数，传 0 则取默认值 1。
 func Open(path string, maxOpenConns, maxIdleConns int) (*DB, error) {
+	// 针对写入优化的 SQLite 连接串：
+	// _journal_mode=WAL   使用 WAL 日志以提升并发能力
+	// _synchronous=NORMAL 在安全性与性能之间取平衡
+	return open(path+"?_foreign_keys=on&_journal_mode=WAL&_synchronous=NORMAL&"+commonDSNParams, maxOpenConns, maxIdleConns)
+}
+
+// OpenReadOnly 以只读方式打开数据库，供 API 服务使用。
+//
+// 服务运行期间语料是只读的（数据由 processor 离线导入），只读打开让这一点由
+// SQLite 来保证，而不是靠约定：任何误写都会直接报错，而不是悄悄改动线上数据。
+// _query_only 在连接层面再拦一道，覆盖 mode=ro 管不到的 PRAGMA 等写操作。
+//
+// 发布的数据库是 WAL 模式，SQLite 只读打开 WAL 库时仍需创建 -shm 文件，
+// 因此数据库所在目录必须可写（Docker 镜像中的 data 卷满足这一点）。
+func OpenReadOnly(path string, maxOpenConns, maxIdleConns int) (*DB, error) {
+	// mode=ro 只在 file: URI 形式的 DSN 中生效，普通路径后的 mode 参数会被静默忽略
+	db, err := open("file:"+path+"?mode=ro&_query_only=1&"+commonDSNParams, maxOpenConns, maxIdleConns)
+	if err != nil {
+		return nil, err
+	}
+
+	// Ping 不会真正打开数据库文件。这里读一次 schema，让文件缺失、损坏或
+	// 目录不可写（无法创建 -shm）在启动时就报错，而不是等到第一个请求。
+	var tables int64
+	if err := db.Raw("SELECT count(*) FROM sqlite_master").Scan(&tables).Error; err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to read database %s: %w", path, err)
+	}
+	return db, nil
+}
+
+// OpenForServing 打开供 API 服务使用的数据库：先补齐结构，再以只读方式提供服务。
+//
+// 服务端只读数据，但启动时仍要跑一次迁移：查询依赖的部分结构（如物化的
+// authors.poem_count 与 counters 计数器）是随版本新增的，用户卷里的老库并不存在，
+// 直接起服务只会在第一个请求上报 "no such column"。迁移需要写权限，
+// 因此用一条临时的读写连接完成后即关闭，之后的所有请求都走只读连接。
+// Migrate 是幂等的，只补缺失的表、列、索引与触发器，不会改动已导入的诗词。
+//
+// 读写模式下 SQLite 会为不存在的路径建一个空库，迁移随后还会把它补成一个
+// 结构完整、却一首诗也没有的库，因此打开前先确认文件存在。
+func OpenForServing(path string, maxOpenConns, maxIdleConns int) (*DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("database not found: %w", err)
+	}
+
+	rw, err := Open(path, 1, 1)
+	if err != nil {
+		return nil, err
+	}
+	migrateErr := rw.Migrate()
+	if err := rw.Close(); err != nil && migrateErr == nil {
+		migrateErr = fmt.Errorf("failed to close migration connection: %w", err)
+	}
+	if migrateErr != nil {
+		return nil, fmt.Errorf("failed to migrate database: %w", migrateErr)
+	}
+
+	return OpenReadOnly(path, maxOpenConns, maxIdleConns)
+}
+
+// commonDSNParams 是读写与只读两种连接共用的参数：
+// _busy_timeout=5000  数据库被锁时最多等待 5 秒
+// _cache_size=-64000  每个连接 64MB 页缓存（负值单位为 KB，正值为页数）
+// _temp_store=MEMORY  临时表与临时索引放在内存中
+//
+// 不用 cache=shared：SQLite 官方不建议使用共享缓存，它在多连接并发时会改用
+// 表级锁，读请求之间可能互相返回 SQLITE_LOCKED，而 WAL 本身已能让读者互不阻塞。
+const commonDSNParams = "_busy_timeout=5000&_cache_size=-64000&_temp_store=MEMORY"
+
+func open(dsn string, maxOpenConns, maxIdleConns int) (*DB, error) {
 	config := &gorm.Config{
 		Logger:      logger.Default.LogMode(logger.Silent), // 调试时可改为 logger.Info
 		NowFunc:     time.Now,
 		PrepareStmt: true, // 预编译语句以提升性能
 	}
-
-	// 针对并发写入优化的 SQLite 连接串：
-	// _busy_timeout=5000  数据库被锁时最多等待 5 秒
-	// _journal_mode=WAL   使用 WAL 日志以提升并发能力
-	// _synchronous=NORMAL 在安全性与性能之间取平衡
-	// cache=shared        多个连接共享缓存
-	// _cache_size=-64000  64MB 页缓存（负值单位为 KB，正值为页数）
-	// _temp_store=MEMORY  临时表与临时索引放在内存中
-	dsn := path + "?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL&cache=shared&_cache_size=-64000&_temp_store=MEMORY"
 
 	db, err := gorm.Open(sqlite.Open(dsn), config)
 	if err != nil {
@@ -79,6 +145,44 @@ func NewDBFromGorm(db *gorm.DB) *DB {
 }
 
 // Migrate 为简体、繁体两套表创建全部表结构、索引与初始数据。
+// metadataImportFinalized 标记数据库已由 FinalizeImport 收尾。
+const metadataImportFinalized = "import_finalized"
+
+// importFinalized 判断数据库是否已收尾。metadata 表不存在（如测试只建了部分表）时视为未收尾。
+func (db *DB) importFinalized() bool {
+	var n int64
+	err := db.Raw("SELECT COUNT(*) FROM metadata WHERE key = ?", metadataImportFinalized).Scan(&n).Error
+	return err == nil && n > 0
+}
+
+// FinalizeImport 删除只在导入时用到的结构，供导入全部完成、VACUUM 之前调用。
+//
+// 唯一索引 (title, content_hash, author_id) 与 content_hash 列只用于导入时跳过重复记录：
+// 去重本来就在写库前完成，二者在发布库里只占空间（两套表合计约 100MB）。
+// 删掉以后库里不能再导入数据，因此同时写入标记，让之后的 Migrate 不再重建它们。
+// 另外合并 FTS 索引的分段：逐批写入会留下许多小分段，合并后更小，查询也少查几段。
+func (db *DB) FinalizeImport() error {
+	for _, lang := range []Lang{LangHans, LangHant} {
+		poemTable := PoemsTable(lang)
+		ftsTable := PoemsFtsTable(lang)
+		for _, stmt := range []string{
+			fmt.Sprintf("DROP INDEX IF EXISTS idx_%s_unique_author", poemTable),
+			fmt.Sprintf("DROP INDEX IF EXISTS idx_%s_unique", poemTable),
+			fmt.Sprintf("ALTER TABLE %s DROP COLUMN content_hash", poemTable),
+			fmt.Sprintf("INSERT INTO %s(%s) VALUES('optimize')", ftsTable, ftsTable),
+		} {
+			if err := db.Exec(stmt).Error; err != nil {
+				return fmt.Errorf("failed to finalize %s: %s: %w", poemTable, stmt, err)
+			}
+		}
+	}
+
+	return db.Exec(
+		`INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES (?, ?, ?)`,
+		metadataImportFinalized, "1", time.Now(),
+	).Error
+}
+
 func (db *DB) Migrate() error {
 	// 先建元数据表
 	if err := db.Exec(`CREATE TABLE IF NOT EXISTS metadata (
@@ -144,7 +248,7 @@ func (db *DB) migrateTablesForLang(lang Lang) error {
 	// 该列由 RefreshAuthorPoemCounts 在导入结束后重算，见其文档说明。
 	authorSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL UNIQUE,
+		name TEXT NOT NULL,
 		dynasty_id INTEGER,
 		description TEXT,
 		poem_count INTEGER NOT NULL DEFAULT 0,
@@ -156,6 +260,15 @@ func (db *DB) migrateTablesForLang(lang Lang) error {
 	}
 	// dynasty_id 索引
 	db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_dynasty ON %s(dynasty_id)", authorTable, authorTable))
+
+	// 作者以「名字 + 朝代」区分：同名异人很常见（唐代张潮与清代《幽梦影》作者张潮，
+	// 各朝代的「佚名」），源数据也是每个朝代各有一份作者表与小传。
+	// 唯一性用独立的索引而不是列约束表达：老库的 name 列上仍带着 UNIQUE，
+	// 在老库上补建这个索引同样成立，写入时的 ON CONFLICT (name, dynasty_id) 两边都能匹配。
+	if err := db.Exec(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_name_dynasty ON %s(name, dynasty_id)",
+		authorTable, authorTable)).Error; err != nil {
+		return fmt.Errorf("failed to create author name index on %s: %w", authorTable, err)
+	}
 
 	// 早于 poem_count 的库里没有这一列，补上。CREATE TABLE IF NOT EXISTS 对已存在的表
 	// 是空操作，不会带来新列，因此必须显式 ALTER。
@@ -204,14 +317,21 @@ func (db *DB) migrateTablesForLang(lang Lang) error {
 	}
 
 	// 诗词表索引
-	db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_type ON %s(type_id)", poemTable, poemTable))
-	db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_title ON %s(title)", poemTable, poemTable))
 	db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_author ON %s(author_id)", poemTable, poemTable))
 	db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_dynasty ON %s(dynasty_id)", poemTable, poemTable))
-	// 唯一索引含作者：同文不同作者（《全唐诗》重出诗）各自保留。索引名带 _author，避免沿用旧库中不含作者的同名索引
-	db.Exec(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_author ON %s(title, content_hash, author_id)", poemTable, poemTable))
-	// 复合索引，用于多体裁随机取词（type_id IN ... 叠加 id 范围查找）
+	// 复合索引，用于按体裁过滤与多体裁随机取词（type_id IN ... 叠加 id 范围查找）
 	db.Exec(fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_type_id ON %s(type_id, id)", poemTable, poemTable))
+	// 旧库中多余的索引：SQLite 的索引都隐含 rowid，(type_id) 与上面的 (type_id, id) 完全等价；
+	// 标题上的普通索引没有任何查询用到，标题检索走 FTS
+	db.Exec(fmt.Sprintf("DROP INDEX IF EXISTS idx_%s_type", poemTable))
+	db.Exec(fmt.Sprintf("DROP INDEX IF EXISTS idx_%s_title", poemTable))
+
+	// 唯一索引只在导入时用来跳过重复记录，FinalizeImport 会把它连同 content_hash 列一起删掉；
+	// 已收尾的库不能再建，否则服务每次启动都会在只读的发布库上把它重建一遍。
+	// 唯一索引含作者：同文不同作者（《全唐诗》重出诗）各自保留。索引名带 _author，避免沿用旧库中不含作者的同名索引
+	if !db.importFinalized() {
+		db.Exec(fmt.Sprintf("CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_author ON %s(title, content_hash, author_id)", poemTable, poemTable))
+	}
 
 	if err := db.migrateFtsForLang(lang); err != nil {
 		return err
@@ -226,7 +346,8 @@ func (db *DB) migrateTablesForLang(lang Lang) error {
 		return err
 	}
 
-	return nil
+	// 倒排索引从 FTS 表构建，必须放在 FTS 之后
+	return db.migrateCharIndex(lang)
 }
 
 // countersTable 保存物化的行数计数器，每行一个计数。
@@ -293,7 +414,7 @@ func (db *DB) RefreshPoemCounter(lang Lang) error {
 		return fmt.Errorf("failed to refresh poem counter for %s: %w", lang, err)
 	}
 
-	db.counts.invalidate()
+	db.invalidateCaches()
 	return nil
 }
 
@@ -374,7 +495,7 @@ func (db *DB) RefreshAuthorPoemCounts(lang Lang) error {
 		return fmt.Errorf("failed to refresh poem_count on %s: %w", authorTable, err)
 	}
 
-	db.counts.invalidate()
+	db.invalidateCaches()
 	return nil
 }
 
