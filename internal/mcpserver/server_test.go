@@ -16,6 +16,7 @@ import (
 	"gorm.io/datatypes"
 
 	"github.com/palemoky/chinese-poetry-api/internal/database"
+	"github.com/palemoky/chinese-poetry-api/internal/semantic"
 	"github.com/palemoky/chinese-poetry-api/internal/testutil"
 )
 
@@ -64,8 +65,14 @@ func seedTypedPoem(t *testing.T, repo *database.Repository, typeName string, id 
 // connect 启动 HTTP 服务并用 SDK 的客户端连上，覆盖序列化与 schema 校验的完整链路。
 func connect(t *testing.T, repo *database.Repository) *mcp.ClientSession {
 	t.Helper()
+	return connectWith(t, repo, nil)
+}
 
-	srv := httptest.NewServer(NewHandler(repo))
+// connectWith 与 connect 相同，但启用语义检索。
+func connectWith(t *testing.T, repo *database.Repository, searcher *semantic.Searcher) *mcp.ClientSession {
+	t.Helper()
+
+	srv := httptest.NewServer(NewHandler(repo, searcher))
 	t.Cleanup(srv.Close)
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil)
@@ -120,6 +127,7 @@ func TestSearchPoems(t *testing.T) {
 	_, repo := setupRepo(t)
 	seedPoem(t, repo, 1, "静夜思", "李白", "唐", "床前明月光，", "疑是地上霜。")
 	seedPoem(t, repo, 2, "春晓", "孟浩然", "唐", "春眠不觉晓，", "处处闻啼鸟。")
+	seedPoem(t, repo, 3, "春日", "朱熹", "宋", "胜日寻芳泗水滨，", "无边光景一时新。")
 	session := connect(t, repo)
 
 	t.Run("matches and keeps paragraphs", func(t *testing.T) {
@@ -141,6 +149,16 @@ func TestSearchPoems(t *testing.T) {
 		assert.NotContains(t, text, `_id"`)
 	})
 
+	t.Run("filters by dynasty", func(t *testing.T) {
+		out := callInto[PoemsOutput](t, session, "search_poems", map[string]any{"query": "春", "dynasty": "宋"})
+		require.Len(t, out.Poems, 1)
+		assert.Equal(t, "春日", out.Poems[0].Title)
+
+		out = callInto[PoemsOutput](t, session, "search_poems", map[string]any{"query": "春", "dynasty": "唐"})
+		require.Len(t, out.Poems, 1)
+		assert.Equal(t, "春晓", out.Poems[0].Title)
+	})
+
 	t.Run("no match is an empty list, not an error", func(t *testing.T) {
 		text, isError := call(t, session, "search_poems", map[string]any{"query": "不存在的内容"})
 		assert.False(t, isError)
@@ -152,6 +170,7 @@ func TestSearchPoems(t *testing.T) {
 		"bad search_type": {"query": "明月", "search_type": "meaning"},
 		"bad lang":        {"query": "明月", "lang": "en"},
 		"page too large":  {"query": "明月", "page_size": maxPageSize + 1},
+		"unknown dynasty": {"query": "明月", "dynasty": "大明"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, isError := call(t, session, "search_poems", args)
@@ -348,7 +367,7 @@ func post(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder 
 
 func TestRejectsBatches(t *testing.T) {
 	_, repo := setupRepo(t)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 
 	call := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_statistics","arguments":{}}}`
 	for name, body := range map[string]string{
@@ -366,14 +385,14 @@ func TestRejectsBatches(t *testing.T) {
 func TestRejectsOversizedBody(t *testing.T) {
 	_, repo := setupRepo(t)
 
-	w := post(t, NewHandler(repo), strings.Repeat(" ", maxBodyBytes+1))
+	w := post(t, NewHandler(repo, nil), strings.Repeat(" ", maxBodyBytes+1))
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
 // 反代转发过来的请求 Host 是公网域名，SDK 默认的 DNS 重绑定保护会把它们 403。
 func TestAcceptsProxiedHost(t *testing.T) {
 	_, repo := setupRepo(t)
-	h := NewHandler(repo)
+	h := NewHandler(repo, nil)
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
@@ -399,6 +418,6 @@ func TestGetIsMethodNotAllowed(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
 	req.Header.Set("Accept", "text/event-stream")
 	w := httptest.NewRecorder()
-	NewHandler(repo).ServeHTTP(w, req)
+	NewHandler(repo, nil).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
 }

@@ -96,8 +96,14 @@ curl "http://localhost:1279/api/v1/poems?dynasty_id=1&type_id=11&type_id=12" # �
 # 游标翻页：把上一页 pagination.next_cursor 的值回传给 after。
 curl "http://localhost:1279/api/v1/poems?page_size=50&after=cG9lbTo0MjA"
 
-# 搜索诗词
+# 搜索诗词，结果按相关度排序
 curl "http://localhost:1279/api/v1/poems/search?q=静夜思"
+
+# 在某个朝代内搜索（也可用 dynasty_id），排序与不限朝代时一致
+curl "http://localhost:1279/api/v1/poems/search?q=月&dynasty=唐"
+
+# 按意思检索（需启用语义检索，见下文）
+curl "http://localhost:1279/api/v1/poems/semantic?q=下雪天一个老人独自在小船上钓鱼&limit=10"
 
 # 随机诗词
 curl "http://localhost:1279/api/v1/poems/random"
@@ -105,6 +111,7 @@ curl "http://localhost:1279/api/v1/poems/random"
 # 随机诗词（带过滤）
 curl "http://localhost:1279/api/v1/poems/random?author=李白"
 curl "http://localhost:1279/api/v1/poems/random?type=五言绝句"
+curl "http://localhost:1279/api/v1/poems/random?type=唐诗&dynasty=唐" # 「唐诗」等分类名涵盖整个分类（五言绝句、七言律诗等），不限朝代
 curl "http://localhost:1279/api/v1/poems/random?char=春" # 飞花令等单字场景
 curl "http://localhost:1279/api/v1/poems/random?author=李白&type=五言绝句"
 curl "http://localhost:1279/api/v1/poems/random?author=李白&type=五言绝句&dynasty=唐"
@@ -164,6 +171,16 @@ query {
   }
 }
 
+# 按意思检索（需启用语义检索）
+query {
+  semanticSearchPoems(query: "夜里船停在苏州城外，听见寺庙的钟声", limit: 5) {
+    title
+    author {
+      name
+    }
+  }
+}
+
 # 统计信息
 query {
   statistics {
@@ -191,13 +208,14 @@ claude mcp add --transport http poetry http://localhost:1279/mcp
 
 | 工具 | 说明 |
 |------|------|
-| `search_poems` | 按字面子串搜索标题、正文或作者 |
+| `search_poems` | 按字面子串搜索标题、正文或作者，可限定朝代，结果按相关度排序 |
 | `list_poems` | 按作者、朝代、体裁筛选诗词 |
 | `random_poem` | 随机一首诗词，可限定条件或指定包含某字 |
 | `get_author` | 按姓名查询作者小传与作品数 |
 | `get_statistics` | 查询总量及可用的朝代、体裁 |
+| `search_poems_by_meaning` | 按意思检索，返回约 30 首候选供模型挑选；仅在启用语义检索时提供 |
 
-所有工具都是只读的，并共用服务的 IP 限流。工具一律按名称访问数据，结果中不含 ID，因为 ID 在数据更新后可能变化。搜索是字面匹配而不是语义匹配，名称需要与 `lang` 选择的简繁写法一致。
+所有工具都是只读的，并共用服务的 IP 限流。工具一律按名称访问数据，结果中不含 ID，因为 ID 在数据更新后可能变化。`search_poems` 是字面匹配，名称需要与 `lang` 选择的简繁写法一致。
 
 ## 搜索功能
 
@@ -207,6 +225,42 @@ claude mcp add --transport http poetry http://localhost:1279/mcp
 |  `title`  |     标题搜索     |    `?q=静夜思&type=title`    |
 | `content` |     内容搜索     | `?q=床前明月光&type=content` |
 | `author`  |     作者搜索     |    `?q=李白&type=author`     |
+
+搜索按子串匹配，结果按相关度排序：标题与查询完全相同的排在最前，搜词牌名（如“声声慢”）时“声声慢·寻寻觅觅”也算完全相同；其次是标题包含、作者名、正文包含。收在《唐诗三百首》《千家诗》《宋词三百首》里的名篇另外加分，所以搜“声声慢”时李清照那首排在第一。分数相同时按 ID 排序，`content` 类型的结果都按 ID 排序。
+
+## 语义检索（可选）
+
+语义检索可以用白话、英文描述或记不全的句子找诗，例如“夜里船停在苏州城外，听见寺庙的钟声”能找到《枫桥夜泊》。它把查询向量与每首诗的向量比较，再与关键词搜索的结果融合，名篇另外加分。效果与取舍见 [评测](eval/semantic/README.md)。
+
+启用需要两样东西，缺一样时服务照常运行，只是不提供这项功能：
+
+1. **向量文件** `poetry-vectors.db`：随数据一起发布为 `poetry-vectors.db.zst`（约 200MB），放在主库旁边（默认 `data/poetry-vectors.db`，可用 `VECTORS_PATH` 指定）。它必须与主库来自同一次发布，否则服务拒绝加载。用 Docker 时不必手动下载：配置了 `EMBEDDING_API_URL` 后，容器启动时会下载与数据库配套的向量文件，并随数据库一起更新。
+
+   也可以自己生成，在 Apple M 系列芯片上约需 2 小时，中断后可以续跑：
+
+   ```bash
+   ollama pull bge-m3
+   go run -tags sqlite_fts5 ./cmd/processor embed --db data/poetry.db -o data/poetry-vectors.db
+   ```
+
+2. **嵌入接口**：用同一个模型把查询转成向量，任何 OpenAI 兼容的 `/embeddings` 接口都可以。用本机的 Ollama：
+
+   ```bash
+   ollama pull bge-m3
+   EMBEDDING_API_URL=http://localhost:11434/v1   # 容器内访问宿主机用 http://host.docker.internal:11434/v1
+   ```
+
+   改用云服务时，用 `EMBEDDING_MODEL` 指定它对这个模型的叫法，用 `EMBEDDING_API_KEY` 传密钥。例如[硅基流动](https://siliconflow.cn)：接口 `https://api.siliconflow.cn/v1`，模型 `BAAI/bge-m3`（免费）或 `Pro/BAAI/bge-m3`（付费）。不同服务部署的模型未必完全一致，启用前先确认它产生的向量与向量文件相同：
+
+   ```bash
+   EMBEDDING_API_KEY=... go run -tags sqlite_fts5 ./cmd/processor check-embeddings \
+     --db data/poetry.db --vectors data/poetry-vectors.db \
+     --api https://api.siliconflow.cn/v1 --model BAAI/bge-m3 --api-key-env EMBEDDING_API_KEY
+   ```
+
+发布数据时，CI 会复用上一版的向量，只把改动过的诗交给硅基流动嵌入，需要在仓库中配置 `SILICONFLOW_API_KEY`；未配置时只发布数据库。
+
+启用后，服务启动时多花约 2 秒载入向量，常驻内存增加约 350MB。每次检索约 30ms，另加一次嵌入请求的耗时。REST 接口 `/api/v1/poems/semantic` 与 GraphQL 查询 `semanticSearchPoems(query, lang, limit)` 都不分页，用 `limit` 指定条数（默认 20，最多 50）。未启用时 REST 返回 503、GraphQL 返回错误；嵌入接口出错时 REST 返回 502。
 
 ## 数据集
 

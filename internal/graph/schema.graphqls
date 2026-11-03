@@ -9,9 +9,6 @@ enum Lang {
 }
 
 type Query {
-  "Get a single poem by ID"
-  poem(id: ID!, lang: Lang = ZH_HANS): Poem
-
   """
   Get a list of poems with pagination and filters.
 
@@ -34,14 +31,22 @@ type Query {
     typeId: ID
   ): PoemConnection!
 
-  "Search poems by query"
+  "Search poems by query, optionally within one dynasty. Results keep the same relevance order either way."
   searchPoems(
     query: String!
     lang: Lang = ZH_HANS
     searchType: SearchType = ALL
     page: Int = 1
     pageSize: Int = 20
+    dynastyId: ID
   ): PoemConnection!
+
+  """
+  Find poems by meaning from a description in any language: a theme, a scene, a feeling or a
+  half-remembered line. Returns up to limit poems (default 20, at most 50) ranked by combined meaning
+  and literal match. Fails when the server has not enabled semantic search.
+  """
+  semanticSearchPoems(query: String!, lang: Lang = ZH_HANS, limit: Int = 20): [Poem!]!
 
   "Get a random poem"
   randomPoem(lang: Lang = ZH_HANS, dynastyId: ID, typeId: ID): Poem
@@ -75,8 +80,11 @@ enum SearchType {
 }
 
 
+"""
+A poem. It has no ID: poem IDs are assigned on import and may change with every data release, so a
+stored ID could point to another poem later.
+"""
 type Poem {
-  id: ID!
   title: String!
   content: [String!]!
   author: Author

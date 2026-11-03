@@ -10,6 +10,7 @@ import (
 	"github.com/palemoky/chinese-poetry-api/internal/database"
 	"github.com/palemoky/chinese-poetry-api/internal/graph/generated"
 	"github.com/palemoky/chinese-poetry-api/internal/graph/model"
+	"github.com/palemoky/chinese-poetry-api/internal/semantic"
 )
 
 // ServerOptions 是构造 GraphQL 服务时的可调参数。
@@ -57,8 +58,15 @@ func setComplexity(c *generated.ComplexityRoot) {
 	c.Query.Poems = func(child int, _ *database.Lang, _ *int, pageSize *int, _ *string, _ *string, _ *string, _ *string) int {
 		return pagedComplexity(child, pageSize)
 	}
-	c.Query.SearchPoems = func(child int, _ string, _ *database.Lang, _ *model.SearchType, _ *int, pageSize *int) int {
+	c.Query.SearchPoems = func(child int, _ string, _ *database.Lang, _ *model.SearchType, _ *int, pageSize *int, _ *string) int {
 		return pagedComplexity(child, pageSize)
+	}
+	c.Query.SemanticSearchPoems = func(child int, _ string, _ *database.Lang, limit *int) int {
+		n := defaultSemanticLimit
+		if limit != nil {
+			n = min(max(*limit, 1), semantic.MaxLimit)
+		}
+		return 1 + child*n
 	}
 	c.Query.Authors = func(child int, _ *database.Lang, _ *int, pageSize *int, _ *string) int {
 		return pagedComplexity(child, pageSize)

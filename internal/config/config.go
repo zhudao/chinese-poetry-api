@@ -18,6 +18,7 @@ type Config struct {
 	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
 	GraphQL   GraphQLConfig   `mapstructure:"graphql"`
 	Search    SearchConfig    `mapstructure:"search"`
+	Semantic  SemanticConfig  `mapstructure:"semantic"`
 }
 
 // ServerConfig 是服务端配置。
@@ -75,6 +76,17 @@ type SearchConfig struct {
 	DefaultPageSize int `mapstructure:"default_page_size"`
 }
 
+// SemanticConfig 是语义检索的配置。向量文件与嵌入接口都有时才启用。
+// 嵌入接口的密钥只从环境变量 EMBEDDING_API_KEY 读取，不放进配置文件。
+type SemanticConfig struct {
+	// VectorsPath 是向量文件 poetry-vectors.db 的路径。
+	VectorsPath string `mapstructure:"vectors_path"`
+	// EmbeddingURL 是 OpenAI 兼容的嵌入接口地址，如 http://localhost:11434/v1。
+	EmbeddingURL string `mapstructure:"embedding_url"`
+	// EmbeddingModel 是查询所用的模型名，为空时取向量文件记录的模型。
+	EmbeddingModel string `mapstructure:"embedding_model"`
+}
+
 // Load 从配置文件与环境变量中加载配置。
 func Load(configPath string) (*Config, error) {
 	v := viper.New()
@@ -84,9 +96,8 @@ func Load(configPath string) (*Config, error) {
 
 	// 指定了配置文件则读取
 	if configPath != "" {
-		v.SetConfigFile(configPath)
-		if err := v.ReadInConfig(); err != nil {
-			return nil, fmt.Errorf("failed to read config file: %w", err)
+		if err := readConfigFile(v, configPath); err != nil {
+			return nil, err
 		}
 	}
 
@@ -107,6 +118,36 @@ func Load(configPath string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// readConfigFile 读取配置文件并合并进 v，合并前去掉值为 null 的键。
+// 一个段的子项全部注释掉时（如 config.yaml 里的 semantic:），这个段解析为 null。
+// viper 遇到 null 段时，只要再对其中的键调用 Set（环境变量就是这样写入的），
+// Unmarshal 就会丢掉这一段其余键的默认值：设了 EMBEDDING_API_URL 后
+// semantic.vectors_path 变成空串，语义检索因找不到向量文件而关闭。
+func readConfigFile(v *viper.Viper, path string) error {
+	file := viper.New()
+	file.SetConfigFile(path)
+	if err := file.ReadInConfig(); err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+	if err := v.MergeConfigMap(dropNulls(file.AllSettings())); err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+	return nil
+}
+
+// dropNulls 递归去掉 m 中值为 nil 的键。
+func dropNulls(m map[string]any) map[string]any {
+	for k, val := range m {
+		switch val := val.(type) {
+		case nil:
+			delete(m, k)
+		case map[string]any:
+			m[k] = dropNulls(val)
+		}
+	}
+	return m
 }
 
 func setDefaults(v *viper.Viper) {
@@ -131,6 +172,8 @@ func setDefaults(v *viper.Viper) {
 	// 数据库连接池，0 表示自动推算（在 Load 中依据 runtime.NumCPU 确定）
 	v.SetDefault("database.max_open_conns", 0)
 	v.SetDefault("database.max_idle_conns", 0)
+	// 与主库放在同一个卷里
+	v.SetDefault("semantic.vectors_path", "data/poetry-vectors.db")
 }
 
 func bindEnvVars(v *viper.Viper) {
@@ -166,6 +209,17 @@ func bindEnvVars(v *viper.Viper) {
 		if b, err := strconv.Atoi(burst); err == nil {
 			v.Set("rate_limit.burst", b)
 		}
+	}
+
+	// 语义检索
+	if path := os.Getenv("VECTORS_PATH"); path != "" {
+		v.Set("semantic.vectors_path", path)
+	}
+	if url := os.Getenv("EMBEDDING_API_URL"); url != "" {
+		v.Set("semantic.embedding_url", url)
+	}
+	if model := os.Getenv("EMBEDDING_MODEL"); model != "" {
+		v.Set("semantic.embedding_model", model)
 	}
 
 	// 数据库连接池

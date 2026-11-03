@@ -3,6 +3,7 @@ package database
 import (
 	"crypto/rand"
 	"math/big"
+	"slices"
 	"strings"
 
 	"gorm.io/gorm"
@@ -184,6 +185,11 @@ func (r *Repository) ListPoemsAfter(limit int, after *int64, dynastyID, authorID
 // listPoems 是 OFFSET 与游标两种分页方式的共同实现：两者只在如何定位起点上有区别，
 // 过滤条件、计数与排序必须完全一致，否则同一份数据在两种翻页方式下会呈现出不同的顺序。
 func (r *Repository) listPoems(limit, offset int, after *int64, dynastyID, authorID *int64, typeIDs []int64) ([]Poem, int, error) {
+	typeIDs, err := r.expandCategoryTypes(typeIDs)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	applyFilters := func(q *gorm.DB) *gorm.DB {
 		if dynastyID != nil {
 			q = q.Where("dynasty_id = ?", *dynastyID)
@@ -203,7 +209,6 @@ func (r *Repository) listPoems(limit, offset int, after *int64, dynastyID, autho
 	// 无过滤时读物化计数器：COUNT(*) 要扫完一整棵索引，是唯一一个代价随表大小
 	// 增长的计数。带过滤时走的是索引区间扫描，代价随命中数增长，交给 TTL 缓存即可。
 	var totalCount int64
-	var err error
 	if dynastyID == nil && authorID == nil && len(typeIDs) == 0 {
 		var n int
 		n, err = r.CountPoems()
@@ -249,6 +254,11 @@ func (r *Repository) listPoems(limit, offset int, after *int64, dynastyID, autho
 // 采用「先 COUNT 再随机 OFFSET」的方式，保证结果在过滤集合内均匀分布。
 // 过滤集合为空时返回 gorm.ErrRecordNotFound，其余错误原样返回。
 func (r *Repository) GetRandomPoem(dynastyID, authorID *int64, typeIDs []int64) (*Poem, error) {
+	typeIDs, err := r.expandCategoryTypes(typeIDs)
+	if err != nil {
+		return nil, err
+	}
+
 	applyFilters := func(q *gorm.DB) *gorm.DB {
 		if dynastyID != nil {
 			q = q.Where("dynasty_id = ?", *dynastyID)
@@ -265,7 +275,6 @@ func (r *Repository) GetRandomPoem(dynastyID, authorID *int64, typeIDs []int64) 
 	// 计数与 listPoems 共用同一套来源与缓存键：无过滤读计数器，带过滤走 TTL 缓存。
 	// 随机接口是被反复刷新的那一类，每次都现数一遍很不划算。
 	var count int64
-	var err error
 	if dynastyID == nil && authorID == nil && len(typeIDs) == 0 {
 		var n int
 		n, err = r.CountPoems()
@@ -291,6 +300,38 @@ func (r *Repository) GetRandomPoem(dynastyID, authorID *int64, typeIDs []int64) 
 	})
 }
 
+// expandCategoryTypes 把 typeIDs 中代表整个分类的体裁展开为该分类下的全部体裁，返回升序去重的 ID。
+//
+// 「唐诗」既是一个体裁，也是五言绝句、七言律诗等体裁所属的分类。按格律能判定的诗都归入
+// 具体的体裁，「唐诗」体裁本身没有作品，按它过滤因此什么也查不到（#120）。
+// 名称与所属分类相同的体裁视为分类本身，按它过滤即按整个分类过滤。
+// 体裁表只有十几行，这条查询的代价可以忽略。
+func (r *Repository) expandCategoryTypes(typeIDs []int64) ([]int64, error) {
+	if len(typeIDs) == 0 {
+		return typeIDs, nil
+	}
+	table := r.poetryTypesTable()
+	var ids []int64
+	err := r.conn().Table(table).
+		Where("id IN ?", typeIDs).
+		Or("category IN (?)", r.conn().Table(table).
+			Select("category").
+			Where("id IN ? AND name = category", typeIDs)).
+		Order("id").
+		Pluck("id", &ids).Error
+	if err != nil {
+		return nil, err
+	}
+	// 不存在的 ID 查不到行，原样保留，使其照旧匹配不到任何诗词
+	for _, id := range typeIDs {
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids), nil
+}
+
 // GetRandomPoemByChar 随机返回一首正文包含指定汉字的诗词（用于飞花令等玩法）。
 // 与 GetRandomPoem 不同，此方法有意不支持叠加作者/体裁/朝代过滤：
 // 它依赖 FTS 联表来定位候选，与其他方法使用的 id/dynasty/author/type 过滤属于
@@ -309,7 +350,7 @@ func (r *Repository) GetRandomPoemByChar(char string) (*Poem, error) {
 		if err != nil {
 			return nil, err
 		}
-		poems, err := r.poemsByIDs(ids[i.Int64() : i.Int64()+1])
+		poems, err := r.PoemsByIDs(ids[i.Int64() : i.Int64()+1])
 		if err != nil {
 			return nil, err
 		}
@@ -416,6 +457,12 @@ func (r *Repository) ListAuthorPoems(authorID int64, limit, offset int) ([]Poem,
 // 单字、双字中文查询。
 // searchType 可取："all"、"title"、"content"、"author"。
 func (r *Repository) SearchPoems(query string, searchType string, page, pageSize int) ([]Poem, int64, error) {
+	return r.SearchPoemsInDynasty(query, searchType, nil, page, pageSize)
+}
+
+// SearchPoemsInDynasty 与 SearchPoems 相同，dynastyID 不为 nil 时只返回该朝代的诗词，
+// 排序与不限朝代时一致。
+func (r *Repository) SearchPoemsInDynasty(query string, searchType string, dynastyID *int64, page, pageSize int) ([]Poem, int64, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -425,62 +472,132 @@ func (r *Repository) SearchPoems(query string, searchType string, page, pageSize
 
 	offset := (page - 1) * pageSize
 
+	if searchType == "content" {
+		// 只搜正文时所有命中同分，保持 ID 顺序。1～2 字的查询走倒排索引，
+		// 其余直接在 SQL 里分页，不必取出完整列表
+		if ids, ok, err := r.shortTermMatches(query, searchType); err != nil {
+			return nil, 0, err
+		} else if ok {
+			ids, err = r.inDynasty(ids, dynastyID, searchType, query)
+			if err != nil {
+				return nil, 0, err
+			}
+			return r.pageOfIDs(ids, offset, pageSize)
+		}
+		return r.searchContent(query, dynastyID, offset, pageSize)
+	}
+
+	ranked, err := r.rankedIDs(query, searchType)
+	if err != nil {
+		return nil, 0, err
+	}
+	ranked, err = r.inDynasty(ranked, dynastyID, searchType, query)
+	if err != nil {
+		return nil, 0, err
+	}
+	return r.pageOfIDs(ranked, offset, pageSize)
+}
+
+// dynastyFilterChunk 是 inDynasty 每条查询带的 ID 个数，低于 SQLite 默认的 32766 个参数上限。
+const dynastyFilterChunk = 10000
+
+// inDynasty 保持顺序地筛出 ids 中属于 dynastyID 的诗词，dynastyID 为 nil 时原样返回。
+// ids 须是 searchType 下 query 的完整命中列表，结果按这三者与朝代进 idLists 缓存：
+// 常用字的命中多达数万首，每翻一页都重筛一遍很浪费。
+func (r *Repository) inDynasty(ids []int64, dynastyID *int64, searchType, query string) ([]int64, error) {
+	if dynastyID == nil || len(ids) == 0 {
+		return ids, nil
+	}
+	cacheKey := newCountKey("in-dynasty", r.lang).addID(*dynastyID).add(searchType).add(query).String()
+	if filtered, hit := r.db.idLists.get(cacheKey); hit {
+		return filtered, nil
+	}
+
+	keep := make(map[int64]bool)
+	for chunk := range slices.Chunk(ids, dynastyFilterChunk) {
+		var matched []int64
+		err := r.conn().Table(r.poemsTable()).
+			Where("dynasty_id = ? AND id IN ?", *dynastyID, chunk).
+			Pluck("id", &matched).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, id := range matched {
+			keep[id] = true
+		}
+	}
+	filtered := make([]int64, 0, len(keep))
+	for _, id := range ids {
+		if keep[id] {
+			filtered = append(filtered, id)
+		}
+	}
+
+	r.db.idLists.set(cacheKey, filtered)
+	return filtered, nil
+}
+
+// SearchPoemIDs 返回 "all" 模式下按相关度排序的前 limit 个命中 id，供语义检索与关键词结果融合。
+func (r *Repository) SearchPoemIDs(query string, limit int) ([]int64, error) {
+	ranked, err := r.rankedIDs(query, "all")
+	if err != nil {
+		return nil, err
+	}
+	return ranked[:min(limit, len(ranked))], nil
+}
+
+// rankedIDs 返回 searchType（"content" 以外）下按相关度排好的完整命中列表。
+func (r *Repository) rankedIDs(query, searchType string) ([]int64, error) {
 	// 1～2 字的查询用不上 trigram 索引，改走单字倒排索引；不适用时（如索引失效）
 	// 继续走下面的原有路径，两者结果一致。
 	if ids, ok, err := r.shortTermMatches(query, searchType); err != nil {
-		return nil, 0, err
+		return nil, err
 	} else if ok {
-		return r.pageOfIDs(ids, offset, pageSize)
+		return r.rankedMatches(query, searchType, ids)
 	}
 
-	// "all" 不能像其他模式那样一条 SQL 搞定：标题、正文与作者名之间的 OR 跨了
-	// FTS 表与作者表，SQLite 无法把它下推给 FTS5，整条查询退化为全表扫描
-	// （实测 3 字查询 0.49s，而单搜正文仅 6ms）。拆成三条各自走索引的查询再合并。
-	if searchType != "title" && searchType != "content" && searchType != "author" {
-		ids, err := r.allModeMatches(query)
-		if err != nil {
-			return nil, 0, err
-		}
-		return r.pageOfIDs(ids, offset, pageSize)
+	// 排好的列表已在缓存里时，不必再求一遍命中集合
+	if ranked, hit := r.db.idLists.get(r.rankedKey(query, searchType)); hit {
+		return ranked, nil
 	}
 
-	poemTable := r.poemsTable()
-	authorTable := r.authorsTable()
-	ftsTable := r.poemsFtsTable()
-	ftsJoin := "JOIN " + ftsTable + " ON " + ftsTable + ".rowid = " + poemTable + ".id"
-
-	authorJoin := "JOIN " + authorTable + " ON " + poemTable + ".author_id = " + authorTable + ".id"
-
-	// 每种搜索模式只在「附加哪些 join 与 where」上有区别，把这部分抽成一个函数，
-	// 计数与取数就能共用同一份条件，不必两处各写一遍、各自漏改。
-	var applyMatch func(*gorm.DB) *gorm.DB
+	var ids []int64
+	var err error
 	switch searchType {
 	case "title":
-		// 仅搜标题，走 FTS trigram 索引
-		applyMatch = func(q *gorm.DB) *gorm.DB {
-			cond, arg := substringMatch(ftsTable+".title", query)
-			return q.Joins(ftsJoin).Where(cond, arg)
-		}
-
-	case "content":
-		// 仅搜正文，走 FTS trigram 索引
-		applyMatch = func(q *gorm.DB) *gorm.DB {
-			cond, arg := substringMatch(ftsTable+".content_text", query)
-			return q.Joins(ftsJoin).Where(cond, arg)
-		}
-
+		ids, err = r.ftsColumnMatches("title", query)
 	case "author":
-		// 仅搜作者名。作者表很小，普通 LIKE 足够快
-		applyMatch = func(q *gorm.DB) *gorm.DB {
-			cond, arg := substringMatch(authorTable+".name", query)
-			return q.Joins(authorJoin).Where(cond, arg)
-		}
+		// 作者表很小，普通 LIKE 足够快
+		ids, err = r.poemIDsByAuthorName(query)
+	default:
+		// "all" 不能一条 SQL 搞定：标题、正文与作者名之间的 OR 跨了 FTS 表与作者表，
+		// SQLite 无法把它下推给 FTS5，整条查询退化为全表扫描
+		// （实测 3 字查询 0.49s，而单搜正文仅 6ms）。拆成三条各自走索引的查询再合并。
+		ids, err = r.allModeMatches(query)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.rankedMatches(query, searchType, ids)
+}
 
+// searchContent 是只搜正文的长查询路径：走 FTS trigram 索引，按 ID 升序分页。
+func (r *Repository) searchContent(query string, dynastyID *int64, offset, pageSize int) ([]Poem, int64, error) {
+	poemTable := r.poemsTable()
+	ftsTable := r.poemsFtsTable()
+	ftsJoin := "JOIN " + ftsTable + " ON " + ftsTable + ".rowid = " + poemTable + ".id"
+	applyMatch := func(q *gorm.DB) *gorm.DB {
+		cond, arg := substringMatch(ftsTable+".content_text", query)
+		q = q.Joins(ftsJoin).Where(cond, arg)
+		if dynastyID != nil {
+			q = q.Where(poemTable+".dynasty_id = ?", *dynastyID)
+		}
+		return q
 	}
 
 	// 计数与页码无关，且要把同一个 FTS join 再跑一遍，代价与取数相当，故走缓存。
 	// 键含用户输入的关键词，缓存的条目数上限见 countCacheMaxEntries。
-	key := newCountKey("search", r.lang).add(searchType).add(query).String()
+	key := newCountKey("search", r.lang).add("content").add(query).addOptionalID(dynastyID).String()
 	total, err := r.db.counts.getOrLoad(key, func() (int64, error) {
 		var n int64
 		err := applyMatch(r.conn().Table(poemTable)).Count(&n).Error
